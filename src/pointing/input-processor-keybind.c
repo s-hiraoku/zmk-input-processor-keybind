@@ -61,6 +61,7 @@ struct zip_keybind_data {
     int32_t max_delta;
     uint8_t device_index;
     enum zip_keybind_key_state state;
+    int64_t wait_until;
 
     const struct device *dev;
     struct k_work_delayable press_work;
@@ -247,6 +248,20 @@ static void press_work_cb(struct k_work *work) {
     const struct device *dev = data->dev;
     const struct zip_keybind_config *cfg = dev->config;
 
+    const int64_t now = k_uptime_get();
+
+    // Still inside the post-release wait window. Discard movement gathered so
+    // far (mirrors the former k_sleep + clear behavior) and re-check once the
+    // window expires, without blocking the system work queue.
+    if (data->wait_until > now) {
+        if (!cfg->track_remainders) {
+            data->delta_x = 0;
+            data->delta_y = 0;
+        }
+        k_work_reschedule(&data->press_work, K_MSEC((uint32_t)(data->wait_until - now)));
+        return;
+    }
+
     bool has_queued_movement = has_pending_movement(data, cfg);
 
     if (data->state != ZIP_KEY_NONE && (!cfg->continuous_key_press || !has_queued_movement)) {
@@ -256,8 +271,17 @@ static void press_work_cb(struct k_work *work) {
         check_and_release_key(data, cfg, ZIP_KEY_UP);
         check_and_release_key(data, cfg, ZIP_KEY_DOWN);
 
-        // wait after release
-        k_sleep(K_MSEC(cfg->wait_ms));
+        // wait after release: defer instead of k_sleep(wait_ms), which blocked
+        // the system work queue (and every other delayed work item on it) for
+        // the whole wait
+        if (cfg->wait_ms > 0) {
+            data->wait_until = now + cfg->wait_ms;
+            if (has_queued_movement) {
+                // keep the queued movement so it fires once the wait expires
+                k_work_reschedule(&data->press_work, K_MSEC(cfg->wait_ms));
+                return;
+            }
+        }
     }
 
     if (has_queued_movement) {

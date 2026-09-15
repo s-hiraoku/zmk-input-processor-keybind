@@ -157,6 +157,11 @@ static int zip_keybind_handle_event(const struct device *dev, struct input_event
         return ZMK_INPUT_PROC_CONTINUE;
     }
 
+    // drop movement during the post-release wait, otherwise it accumulates and
+    // fires a second activation the moment the window expires
+    if (k_uptime_get() < data->wait_until)
+        return ZMK_INPUT_PROC_STOP;
+
     // cutoff small or very large movements
     if (cfg->threshold > abs(value) || abs(value) > cfg->max_threshold)
         return ZMK_INPUT_PROC_STOP;
@@ -250,15 +255,11 @@ static void press_work_cb(struct k_work *work) {
 
     const int64_t now = k_uptime_get();
 
-    // Still inside the post-release wait window. Discard movement gathered so
-    // far (mirrors the former k_sleep + clear behavior) and re-check once the
-    // window expires, without blocking the system work queue.
+    // still waiting: only reachable if this work was scheduled just before the
+    // window opened, since handle_event drops input while it is open
     if (data->wait_until > now) {
-        if (!cfg->track_remainders) {
-            data->delta_x = 0;
-            data->delta_y = 0;
-        }
-        k_work_reschedule(&data->press_work, K_MSEC((uint32_t)(data->wait_until - now)));
+        data->delta_x = 0;
+        data->delta_y = 0;
         return;
     }
 
@@ -272,15 +273,13 @@ static void press_work_cb(struct k_work *work) {
         check_and_release_key(data, cfg, ZIP_KEY_DOWN);
 
         // wait after release: defer instead of k_sleep(wait_ms), which blocked
-        // the system work queue (and every other delayed work item on it) for
-        // the whole wait
+        // the system work queue for the whole wait. Leftover movement is
+        // dropped so that one stroke stays one activation.
         if (cfg->wait_ms > 0) {
             data->wait_until = now + cfg->wait_ms;
-            if (has_queued_movement) {
-                // keep the queued movement so it fires once the wait expires
-                k_work_reschedule(&data->press_work, K_MSEC(cfg->wait_ms));
-                return;
-            }
+            data->delta_x = 0;
+            data->delta_y = 0;
+            return;
         }
     }
 
